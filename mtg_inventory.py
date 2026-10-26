@@ -16,7 +16,7 @@ from pathlib import Path
 
 FIELDS = (
     "name", "set_code", "set_name", "collector_number", "scryfall_id",
-    "quantity", "finish", "condition", "language", "location",
+    "quantity", "finish", "condition", "language", "location", "box",
     "purchase_price", "purchase_currency", "misprint", "altered", "notes",
 )
 SOURCE_FIELDS = ("source_filename", "source_row", "imported_at", "source_sha256", "source_archive")
@@ -26,6 +26,7 @@ DEFAULTS.update(quantity=1, finish="nonfoil", condition="unknown", language="en"
 ALIASES = {
     "card_name": "name", "card_number": "collector_number", "foil": "finish",
     "binder_name": "location", "binder": "location", "list_name": "location",
+    "box_name": "box",
     "purchase_price_currency": "purchase_currency", "currency": "purchase_currency",
 }
 
@@ -37,7 +38,7 @@ def connect(path):
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, 2):
+    if version not in (0, 1, 2, 3):
         db.close()
         raise ValueError("Database schema is newer than this program supports")
     db.executescript("""
@@ -61,6 +62,7 @@ def connect(path):
             condition TEXT NOT NULL,
             language TEXT NOT NULL,
             location TEXT NOT NULL,
+            box TEXT NOT NULL DEFAULT '',
             purchase_price TEXT NOT NULL,
             purchase_currency TEXT NOT NULL,
             misprint INTEGER NOT NULL CHECK (misprint IN (0,1)),
@@ -77,7 +79,9 @@ def connect(path):
     """)
     if "archive_path" not in {row[1] for row in db.execute("PRAGMA table_info(imports)")}:
         db.execute("ALTER TABLE imports ADD COLUMN archive_path TEXT")
-    db.execute("PRAGMA user_version = 2")
+    if "box" not in {row[1] for row in db.execute("PRAGMA table_info(inventory)")}:
+        db.execute("ALTER TABLE inventory ADD COLUMN box TEXT NOT NULL DEFAULT ''")
+    db.execute("PRAGMA user_version = 3")
     db.commit()
     return db
 
@@ -304,7 +308,7 @@ def import_paths(db, paths, dry_run=False):
 
 def query(db, args):
     clauses, params = [], []
-    for field in ("name", "set_code", "location", "finish", "scryfall_id"):
+    for field in ("name", "set_code", "location", "box", "finish", "scryfall_id"):
         value = getattr(args, field, None)
         if value is None:
             continue
@@ -343,12 +347,15 @@ def main(argv=None):
     commands.add_parser("init", help="create the inventory database")
     add_fields(commands.add_parser("add", help="add a separate inventory entry"))
     add_fields(commands.add_parser("edit", help="edit an entry; quantity is the new total"), True)
+    assigner = commands.add_parser("assign-box", help="assign a box to all entries from an import filename")
+    assigner.add_argument("box", help="box label; use an empty string to clear")
+    assigner.add_argument("--source-filename", required=True, help="original CSV filename, including extension")
     importer = commands.add_parser("import-csv", help="import CSV files or folders; archive originals")
     importer.add_argument("paths", nargs="*", help="files/folders; defaults to the database's inbox folder")
     importer.add_argument("--dry-run", action="store_true", help="validate without adding inventory")
     for command in ("list", "export-csv"):
         sub = commands.add_parser(command)
-        for field in ("name", "set_code", "location", "scryfall_id"):
+        for field in ("name", "set_code", "location", "box", "scryfall_id"):
             sub.add_argument("--" + field.replace("_", "-"))
         sub.add_argument("--finish", choices=("nonfoil", "foil", "etched"))
         sub.add_argument("--include-zero", action="store_true")
@@ -387,6 +394,17 @@ def main(argv=None):
                                + ", updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
                                [merged[field] for field in FIELDS] + [args.id])
                 print("Updated entry {}.".format(args.id))
+            elif args.command == "assign-box":
+                with db:
+                    updated = db.execute(
+                        "UPDATE inventory SET box = ?, "
+                        "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                        "WHERE import_id IN (SELECT id FROM imports WHERE filename = ?)",
+                        (args.box.strip(), args.source_filename),
+                    ).rowcount
+                    if not updated:
+                        raise ValueError("No inventory entries from import filename: " + args.source_filename)
+                print("Assigned box {!r} to {} entries.".format(args.box.strip(), updated))
             elif args.command == "import-csv":
                 paths = args.paths or [str(Path(args.db).parent / "inbox")]
                 result = import_paths(db, paths, args.dry_run)

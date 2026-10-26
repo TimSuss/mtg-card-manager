@@ -163,7 +163,7 @@ class InventoryTests(unittest.TestCase):
             old.execute("INSERT INTO imports (sha256, filename, row_count) VALUES (?, ?, ?)",
                         (digest, path.name, 1))
         with contextlib.closing(inventory.connect(legacy)) as upgraded:
-            self.assertEqual(upgraded.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(upgraded.execute("PRAGMA user_version").fetchone()[0], 3)
             result = inventory.import_csv(upgraded, path)
             self.assertEqual(result["status"], "already_imported")
             self.assertEqual((self.root / result["archive_path"]).read_bytes(), path.read_bytes())
@@ -184,6 +184,55 @@ class InventoryTests(unittest.TestCase):
             exported = next(csv.DictReader(file))
         for field in inventory.SOURCE_FIELDS:
             self.assertEqual(exported[field], str(row[field]))
+
+    def test_existing_inventory_migrates_without_losing_data(self):
+        legacy = self.root / "legacy-box.sqlite3"
+        schema = self.db.execute("SELECT sql FROM sqlite_master WHERE name = 'inventory'").fetchone()[0]
+        schema = schema.replace("box TEXT NOT NULL DEFAULT '',", "")
+        fields = [field for field in inventory.FIELDS if field != "box"]
+        values = inventory.normalize({"name": "Sol Ring", "set_code": "cmm", "quantity": "3",
+                                      "location": "Commander binder", "notes": "Keep this"})
+        with sqlite3.connect(str(legacy)) as old:
+            old.execute(schema)
+            old.execute("INSERT INTO inventory ({}) VALUES ({})".format(
+                ",".join(fields), ",".join("?" for _ in fields)), [values[field] for field in fields])
+            old.execute("PRAGMA user_version = 2")
+        with contextlib.closing(inventory.connect(legacy)) as upgraded:
+            row = inventory.query(upgraded, argparse.Namespace())[0]
+            self.assertEqual(row["box"], "")
+            self.assertEqual(row["id"], 1)
+            for field in fields:
+                self.assertEqual(row[field], values[field])
+
+    def test_box_manual_edits_filters_and_csv_roundtrip(self):
+        self.assertEqual(self.run_cli("add", "--name", "Sol Ring", "--set-code", "cmm",
+                                      "--box", "Box 1")[0], 0)
+        self.assertEqual(self.run_cli("edit", "1", "--box", "Box 2")[0], 0)
+        self.assertEqual(len(inventory.query(self.db, argparse.Namespace(box="box 2"))), 1)
+        self.assertEqual(inventory.query(self.db, argparse.Namespace(box="Box 1")), [])
+        target = self.root / "boxes.csv"
+        self.assertEqual(self.run_cli("export-csv", str(target), "--box", "BOX 2")[0], 0)
+        with contextlib.closing(inventory.connect(self.root / "roundtrip.sqlite3")) as db:
+            inventory.import_csv(db, target)
+            self.assertEqual(inventory.query(db, argparse.Namespace())[0]["box"], "Box 2")
+        self.assertEqual(self.run_cli("edit", "1", "--box", "")[0], 0)
+        self.assertEqual(len(inventory.query(self.db, argparse.Namespace(box=""))), 1)
+
+    def test_box_csv_header_and_bulk_assignment_preserve_provenance(self):
+        path = self.csv_file("Name,Set code,Box name,Binder name\nSol Ring,cmm,Box 1,Commander binder\n")
+        inventory.import_csv(self.db, path)
+        other = self.root / "other.csv"
+        other.write_text("Name,Set code,Box\nLightning Bolt,m10,Box 3\n")
+        inventory.import_csv(self.db, other)
+        before = inventory.query(self.db, argparse.Namespace(name="Sol"))[0]
+        self.assertEqual(before["box"], "Box 1")
+        self.assertEqual(self.run_cli("assign-box", " Box 2 ", "--source-filename", "input.csv")[0], 0)
+        after = inventory.query(self.db, argparse.Namespace(box="Box 2"))[0]
+        self.assertEqual(after["location"], "Commander binder")
+        for field in (*inventory.SOURCE_FIELDS, "raw_json", "import_id", "quantity"):
+            self.assertEqual(after[field], before[field])
+        self.assertEqual(len(inventory.query(self.db, argparse.Namespace(box="Box 3"))), 1)
+        self.assertEqual(self.run_cli("assign-box", "Box 4", "--source-filename", "missing.csv")[0], 1)
 
     def test_bad_row_rejects_entire_file(self):
         path = self.csv_file("Name,Set code,Quantity\nSol Ring,cmm,1\nLightning Bolt,m10,-2\n")

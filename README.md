@@ -30,7 +30,7 @@ database). The live database is ignored by Git; archived CSVs and a backup snaps
 are included as described below.
 
 Each entry is a lot: a quantity of copies sharing the same printing, finish, condition,
-language, location, and per-copy purchase price. Adding the same card again creates a
+language, location, box, and per-copy purchase price. Adding the same card again creates a
 separate entry; entries are never silently merged. This preserves different purchases
 and binder locations. A card name alone does not identify its printing.
 
@@ -114,6 +114,7 @@ Supported headers are case insensitive; spaces and underscores are interchangeab
 | Finish | Finish, Foil |
 | Condition / language | Condition, Language |
 | Location | Location, Binder name, Binder, List name |
+| Physical box | Box, Box name |
 | Purchase price | Purchase price |
 | Currency | Purchase currency, Purchase price currency, Currency |
 | Other copy details | Misprint, Altered, Notes |
@@ -148,6 +149,33 @@ not detect equivalent files with reordered rows or changed whitespace. There is 
 import undo or snapshot reconciliation yet.
 
 ## Query and export
+
+### Organize cards by box
+
+Each entry has an optional `box` label, such as `Box 1`. Existing entries start with
+an empty box; upgrades preserve their quantities, locations, and import history.
+The `location` field still holds the binder/list name from ManaBox, so a card can have
+both a box and a binder location. Box labels are not inferred from filenames.
+
+Assign a box to all entries from an existing import, or edit individual entries:
+
+```sh
+python3 mtg_inventory.py assign-box "Box 1" --source-filename "box 1.csv"
+python3 mtg_inventory.py assign-box "Box 2" --source-filename "box 2.csv"
+python3 mtg_inventory.py edit 1 --box "Box 1"
+python3 mtg_inventory.py list --box "Box 1"
+python3 mtg_inventory.py export-csv /tmp/box-1.csv --box "Box 1"
+```
+
+`assign-box` matches the original filename exactly, including its extension. It updates
+every entry from every batch using that filename, including zero-quantity entries,
+and replaces any existing box labels. It leaves the original CSV archives untouched.
+Use `edit ID --box ""` to clear a label, or `list --box ""` to find unassigned entries.
+Refresh your backup after assigning boxes to preserve those changes in Git.
+
+Manual additions accept `add ... --box "Box 1"`. CSV imports accept a `Box` or `Box name`
+column; exports include `box`. Reimporting an identical file still skips its inventory,
+so use `assign-box` or `edit` to label cards that are already imported.
 
 ```sh
 python3 mtg_inventory.py list --name "bolt"
