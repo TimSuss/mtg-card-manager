@@ -2,10 +2,12 @@ import argparse
 import contextlib
 import csv
 import io
+import shutil
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import mtg_inventory as inventory
 
@@ -30,10 +32,47 @@ class InventoryTests(unittest.TestCase):
                 code = inventory.main(["--db", str(self.db_path), *args])
         return code, output.getvalue(), errors.getvalue()
 
+    def test_snapshot_restores_imports_manual_edits_and_archive_links(self):
+        self.db.execute("PRAGMA journal_mode = WAL")
+        source = self.csv_file("Name,Set code,Quantity\nSol Ring,cmm,2\n")
+        inventory.import_csv(self.db, source)
+        self.assertEqual(self.run_cli("edit", "1", "--quantity", "5", "--notes", "Keep this")[0], 0)
+        self.assertEqual(self.run_cli("backup")[0], 0)
+        snapshot = self.root / "snapshot.sqlite3"
+        restored = self.root / "restored"
+        restored.mkdir()
+        shutil.copy2(snapshot, restored / "inventory.sqlite3")
+        shutil.copytree(self.root / "imports", restored / "imports")
+        with contextlib.closing(inventory.connect(restored / "inventory.sqlite3")) as db:
+            row = inventory.query(db, argparse.Namespace())[0]
+            self.assertEqual(row["quantity"], 5)
+            self.assertEqual(row["notes"], "Keep this")
+            self.assertEqual((restored / row["source_archive"]).read_bytes(), source.read_bytes())
+            self.assertEqual(inventory.import_csv(db, source)["status"], "already_imported")
+
+    def test_failed_refresh_preserves_previous_snapshot(self):
+        inventory.backup_database(self.db)
+        snapshot = self.root / "snapshot.sqlite3"
+        previous = snapshot.read_bytes()
+        with mock.patch.object(inventory.os, "replace", side_effect=OSError("test failure")):
+            with self.assertRaises(OSError):
+                inventory.backup_database(self.db)
+        self.assertEqual(snapshot.read_bytes(), previous)
+        self.assertEqual(list(self.root.glob(".snapshot-*")), [])
+
+    def test_backup_refuses_missing_database_and_self_overwrite(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(inventory.main(["--db", str(self.root / "missing.sqlite3"), "backup"]), 1)
+        self.assertFalse((self.root / "missing.sqlite3").exists())
+        with contextlib.closing(inventory.connect(self.root / "snapshot.sqlite3")) as db:
+            with self.assertRaisesRegex(ValueError, "itself"):
+                inventory.backup_database(db)
+
     def test_manabox_preview_import_provenance_and_duplicate_protection(self):
         path = Path(__file__).resolve().parents[1] / "examples" / "manabox.csv"
         preview = inventory.import_csv(self.db, path, dry_run=True)
-        self.assertEqual(preview, {"dry_run": True, "entries": 2, "copies": 5})
+        self.assertEqual(preview, {"status": "ready", "dry_run": True, "entries": 2, "copies": 5})
+        self.assertFalse((self.root / "imports").exists())
         self.assertEqual(self.db.execute("SELECT count(*) FROM imports").fetchone()[0], 0)
         result = inventory.import_csv(self.db, path)
         self.assertEqual(result["copies"], 5)
@@ -42,9 +81,109 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(rows[0]["location"], "Trade binder")
         self.assertIn('"Rarity": "common"', rows[0]["raw_json"])
         self.assertEqual(rows[1]["purchase_price"], "2.25")
-        with self.assertRaisesRegex(ValueError, "already imported"):
-            inventory.import_csv(self.db, path)
+        for index, row in enumerate(rows):
+            self.assertEqual(row["source_filename"], "manabox.csv")
+            self.assertEqual(row["source_row"], index + 2)
+            self.assertEqual(row["import_id"], result["import_id"])
+            self.assertEqual(len(row["source_sha256"]), 64)
+            self.assertTrue(row["imported_at"].endswith("Z"))
+        self.assertEqual(inventory.import_csv(self.db, path)["status"], "already_imported")
         self.assertEqual(self.db.execute("SELECT sum(quantity) FROM inventory").fetchone()[0], 5)
+
+    def test_archive_is_exact_and_survives_original_removal(self):
+        path = self.csv_file("Name,Set code\r\nSol Ring,cmm\r\n")
+        original = path.read_bytes()
+        result = inventory.import_csv(self.db, path)
+        archive = self.root / result["archive_path"]
+        self.assertEqual(archive.read_bytes(), original)
+        path.unlink()
+        row = inventory.query(self.db, argparse.Namespace())[0]
+        self.assertEqual(row["source_archive"], result["archive_path"])
+        self.assertEqual(archive.read_bytes(), original)
+
+    def test_archive_failure_rolls_back_inventory_and_import(self):
+        path = self.csv_file("Name,Set code\nSol Ring,cmm\n")
+        with mock.patch.object(inventory, "write_archive", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                inventory.import_csv(self.db, path)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM inventory").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM imports").fetchone()[0], 0)
+
+    def test_existing_archive_is_verified_and_never_overwritten(self):
+        path = self.csv_file("Name,Set code\nSol Ring,cmm\n")
+        result = inventory.import_csv(self.db, path)
+        archive = self.root / result["archive_path"]
+        archive.write_bytes(b"changed archive")
+        with self.assertRaisesRegex(ValueError, "unexpected contents"):
+            inventory.import_csv(self.db, path)
+        self.assertEqual(archive.read_bytes(), b"changed archive")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM inventory").fetchone()[0], 1)
+
+    def test_folder_import_preview_duplicates_errors_and_repeat(self):
+        inbox = self.root / "inbox"
+        inbox.mkdir()
+        valid = b"Name,Set code,Quantity\nSol Ring,cmm,2\n"
+        (inbox / "a.csv").write_bytes(valid)
+        (inbox / "b.CSV").write_bytes(b"Name,Set code,Quantity\nLightning Bolt,m10,4\n")
+        (inbox / "c.csv").write_bytes(valid)
+        (inbox / "invalid.csv").write_text("Name,Set code,Quantity\nBad,cmm,-1\n")
+        (inbox / "ignored.txt").write_text("ignored")
+        preview = inventory.import_paths(self.db, [inbox], dry_run=True)
+        self.assertEqual(preview["copies"], 6)
+        self.assertFalse((self.root / "imports").exists())
+        self.assertEqual(self.db.execute("SELECT count(*) FROM inventory").fetchone()[0], 0)
+        code, _, _ = self.run_cli("import-csv")
+        self.assertEqual(code, 1)  # Valid files commit; invalid file is reported.
+        self.assertEqual(self.db.execute("SELECT sum(quantity) FROM inventory").fetchone()[0], 6)
+        self.assertEqual(len(list((self.root / "imports").glob("*.csv"))) +
+                         len(list((self.root / "imports").glob("*.CSV"))), 2)
+        again = inventory.import_paths(self.db, [inbox])
+        self.assertEqual(again["copies"], 0)
+        self.assertEqual([row["status"] for row in again["files"]],
+                         ["already_imported", "already_imported", "duplicate_in_batch", "error"])
+
+    def test_several_explicit_files(self):
+        first = self.csv_file("Name,Set code\nSol Ring,cmm\n")
+        second = self.root / "second.csv"
+        second.write_text("Name,Set code\nLightning Bolt,m10\n")
+        code, _, _ = self.run_cli("import-csv", str(first), str(second))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM imports").fetchone()[0], 2)
+
+    def test_old_database_migration_and_archive_backfill(self):
+        legacy = self.root / "legacy.sqlite3"
+        path = self.csv_file("Name,Set code\nSol Ring,cmm\n")
+        import hashlib
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        with sqlite3.connect(str(legacy)) as old:
+            old.executescript("""CREATE TABLE imports (
+                id INTEGER PRIMARY KEY, sha256 TEXT NOT NULL UNIQUE, filename TEXT NOT NULL,
+                row_count INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT '2026-01-01');
+                PRAGMA user_version = 1;""")
+            old.execute("INSERT INTO imports (sha256, filename, row_count) VALUES (?, ?, ?)",
+                        (digest, path.name, 1))
+        with contextlib.closing(inventory.connect(legacy)) as upgraded:
+            self.assertEqual(upgraded.execute("PRAGMA user_version").fetchone()[0], 2)
+            result = inventory.import_csv(upgraded, path)
+            self.assertEqual(result["status"], "already_imported")
+            self.assertEqual((self.root / result["archive_path"]).read_bytes(), path.read_bytes())
+            self.assertEqual(upgraded.execute("SELECT count(*) FROM imports").fetchone()[0], 1)
+
+    def test_source_survives_edit_reopen_and_export(self):
+        path = self.csv_file("Name,Set code\nSol Ring,cmm\n")
+        inventory.import_csv(self.db, path)
+        self.assertEqual(self.run_cli("edit", "1", "--quantity", "2")[0], 0)
+        with contextlib.closing(inventory.connect(self.db_path)) as reopened:
+            row = inventory.query(reopened, argparse.Namespace(name="Sol"))[0]
+        self.assertEqual(row["source_filename"], "input.csv")
+        self.assertEqual(row["source_row"], 2)
+        self.assertEqual(row["quantity"], 2)
+        export = self.root / "export.csv"
+        self.assertEqual(self.run_cli("export-csv", str(export))[0], 0)
+        with export.open(newline="", encoding="utf-8") as file:
+            exported = next(csv.DictReader(file))
+        for field in inventory.SOURCE_FIELDS:
+            self.assertEqual(exported[field], str(row[field]))
 
     def test_bad_row_rejects_entire_file(self):
         path = self.csv_file("Name,Set code,Quantity\nSol Ring,cmm,1\nLightning Bolt,m10,-2\n")
@@ -80,6 +219,8 @@ class InventoryTests(unittest.TestCase):
         rows = inventory.query(self.db, argparse.Namespace(name="SOL", location="trade binder"))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["purchase_price"], "0.10")
+        for field in inventory.SOURCE_FIELDS:
+            self.assertIsNone(rows[0][field])
         export = self.root / "export.csv"
         self.assertEqual(self.run_cli("export-csv", str(export))[0], 0)
         with contextlib.closing(inventory.connect(self.root / "other.sqlite3")) as other:

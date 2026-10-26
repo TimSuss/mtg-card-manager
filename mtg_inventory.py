@@ -5,8 +5,10 @@ import csv
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import sys
+import tempfile
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -17,6 +19,7 @@ FIELDS = (
     "quantity", "finish", "condition", "language", "location",
     "purchase_price", "purchase_currency", "misprint", "altered", "notes",
 )
+SOURCE_FIELDS = ("source_filename", "source_row", "imported_at", "source_sha256", "source_archive")
 DEFAULTS = dict.fromkeys(FIELDS, "")
 DEFAULTS.update(quantity=1, finish="nonfoil", condition="unknown", language="en",
                 misprint=0, altered=0)
@@ -34,7 +37,7 @@ def connect(path):
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1):
+    if version not in (0, 1, 2):
         db.close()
         raise ValueError("Database schema is newer than this program supports")
     db.executescript("""
@@ -43,6 +46,7 @@ def connect(path):
             sha256 TEXT NOT NULL UNIQUE,
             filename TEXT NOT NULL,
             row_count INTEGER NOT NULL,
+            archive_path TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
         CREATE TABLE IF NOT EXISTS inventory (
@@ -70,8 +74,11 @@ def connect(path):
         );
         CREATE INDEX IF NOT EXISTS inventory_name ON inventory(name COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS inventory_scryfall ON inventory(scryfall_id);
-        PRAGMA user_version = 1;
     """)
+    if "archive_path" not in {row[1] for row in db.execute("PRAGMA table_info(imports)")}:
+        db.execute("ALTER TABLE imports ADD COLUMN archive_path TEXT")
+    db.execute("PRAGMA user_version = 2")
+    db.commit()
     return db
 
 
@@ -82,6 +89,30 @@ def boolean(value):
     if value in ("false", "no", "0", ""):
         return 0
     raise ValueError("expected true/false, yes/no, or 1/0")
+
+
+def backup_database(db):
+    """Atomically refresh a standalone, consistent snapshot for Git."""
+    filename = db.execute("PRAGMA database_list").fetchone()[2]
+    if not filename:
+        raise ValueError("Backup requires a file-backed database")
+    source = Path(filename)
+    target = source.with_name("snapshot.sqlite3")
+    if target.resolve() == source.resolve():
+        raise ValueError("Cannot back up a database named snapshot.sqlite3 to itself")
+    descriptor, temporary = tempfile.mkstemp(prefix=".snapshot-", suffix=".sqlite3", dir=source.parent)
+    os.close(descriptor)
+    temporary = Path(temporary)
+    try:
+        with closing(sqlite3.connect(str(temporary))) as destination:
+            db.backup(destination)
+            check = destination.execute("PRAGMA quick_check").fetchall()
+            if check != [("ok",)]:
+                raise ValueError("Database snapshot failed its integrity check")
+        os.replace(str(temporary), str(target))
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
 
 
 def normalize(values):
@@ -173,24 +204,102 @@ def read_csv(data):
     return rows
 
 
-def import_csv(db, path, dry_run=False):
-    data = Path(path).read_bytes()
+def archive_target(db, digest, filename):
+    database = db.execute("PRAGMA database_list").fetchone()[2]
+    if not database:
+        raise ValueError("CSV archiving requires a file-backed database")
+    # Relative paths keep archives portable when the database moves to the Pi.
+    relative = Path("imports") / (digest + "_" + filename[:150])
+    return relative.as_posix(), Path(database).parent / relative
+
+
+def write_archive(target, data):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output = target.open("xb")
+    except FileExistsError:
+        if target.read_bytes() != data:
+            raise ValueError("Archive exists with unexpected contents: {}".format(target))
+        return False
+    try:
+        with output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+    except Exception:
+        target.unlink()
+        raise
+    return True
+
+
+def import_csv(db, path, dry_run=False, *, data=None):
+    if data is None:
+        data = Path(path).read_bytes()
     digest = hashlib.sha256(data).hexdigest()
-    previous = db.execute("SELECT id FROM imports WHERE sha256 = ?", (digest,)).fetchone()
+    previous = db.execute("SELECT * FROM imports WHERE sha256 = ?", (digest,)).fetchone()
     if previous:
-        raise ValueError("This exact file was already imported (batch {}).".format(previous[0]))
+        relative, target = archive_target(db, digest, previous["filename"])
+        if not dry_run:
+            # Also backfill an archive for imports made before archiving was added.
+            with db:
+                write_archive(target, data)
+                db.execute("UPDATE imports SET archive_path = ? WHERE id = ?",
+                           (relative, previous["id"]))
+        return {"status": "already_imported", "import_id": previous["id"],
+                "entries": 0, "copies": 0, "archive_path": relative, "dry_run": dry_run}
     rows = read_csv(data)
     copies = sum(values["quantity"] for _, values, _ in rows)
     if dry_run:
-        return {"dry_run": True, "entries": len(rows), "copies": copies}
-    with db:
-        batch = db.execute(
-            "INSERT INTO imports (sha256, filename, row_count) VALUES (?, ?, ?)",
-            (digest, Path(path).name, len(rows)),
-        ).lastrowid
-        for line, values, raw in rows:
-            insert(db, values, batch, line, raw)
-    return {"import_id": batch, "entries": len(rows), "copies": copies}
+        return {"status": "ready", "dry_run": True, "entries": len(rows), "copies": copies}
+    relative, target = archive_target(db, digest, Path(path).name)
+    created = False
+    try:
+        with db:
+            batch = db.execute(
+                "INSERT INTO imports (sha256, filename, row_count, archive_path) VALUES (?, ?, ?, ?)",
+                (digest, Path(path).name, len(rows), relative),
+            ).lastrowid
+            for line, values, raw in rows:
+                insert(db, values, batch, line, raw)
+            # Archive before commit, so a successful import always has its original file.
+            created = write_archive(target, data)
+    except Exception:
+        if created:
+            target.unlink()
+        raise
+    return {"status": "imported", "import_id": batch, "entries": len(rows),
+            "copies": copies, "archive_path": relative}
+
+
+def import_paths(db, paths, dry_run=False):
+    """Process files independently; keep going and report every failure."""
+    files, results = [], []
+    for value in paths:
+        path = Path(value)
+        if path.is_dir():
+            children = sorted((p for p in path.iterdir() if p.is_file() and p.suffix.lower() == ".csv"),
+                              key=lambda p: p.name)
+            if not children:
+                results.append({"file": str(path), "status": "empty_folder"})
+            files.extend(children)
+        else:
+            files.append(path)
+    seen = set()
+    for path in files:
+        try:
+            data = path.read_bytes()
+            digest = hashlib.sha256(data).hexdigest()
+            if digest in seen:
+                results.append({"file": str(path), "status": "duplicate_in_batch",
+                                "entries": 0, "copies": 0})
+                continue
+            result = import_csv(db, path, dry_run, data=data)
+            seen.add(digest)
+            results.append({"file": str(path), **result})
+        except (ValueError, OSError, sqlite3.Error, csv.Error) as exc:
+            results.append({"file": str(path), "status": "error", "error": str(exc)})
+    return {"dry_run": dry_run, "entries": sum(r.get("entries", 0) for r in results),
+            "copies": sum(r.get("copies", 0) for r in results), "files": results}
 
 
 def query(db, args):
@@ -206,10 +315,15 @@ def query(db, args):
         params.append(value)
     if not getattr(args, "include_zero", False):
         clauses.append("quantity > 0")
-    sql = "SELECT * FROM inventory"
+    sql = ("SELECT inventory.*, imports.filename AS source_filename, "
+           "imports.created_at AS imported_at, imports.sha256 AS source_sha256, "
+           "imports.archive_path AS source_archive "
+           "FROM inventory LEFT JOIN imports ON inventory.import_id = imports.id")
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
-    return [dict(row) for row in db.execute(sql + " ORDER BY name COLLATE NOCASE, id", params)]
+    return [dict(row) for row in db.execute(
+        sql + " ORDER BY name COLLATE NOCASE, inventory.id", params
+    )]
 
 
 def add_fields(parser, editing=False):
@@ -229,8 +343,8 @@ def main(argv=None):
     commands.add_parser("init", help="create the inventory database")
     add_fields(commands.add_parser("add", help="add a separate inventory entry"))
     add_fields(commands.add_parser("edit", help="edit an entry; quantity is the new total"), True)
-    importer = commands.add_parser("import-csv", help="add all rows from a CSV atomically")
-    importer.add_argument("path")
+    importer = commands.add_parser("import-csv", help="import CSV files or folders; archive originals")
+    importer.add_argument("paths", nargs="*", help="files/folders; defaults to the database's inbox folder")
     importer.add_argument("--dry-run", action="store_true", help="validate without adding inventory")
     for command in ("list", "export-csv"):
         sub = commands.add_parser(command)
@@ -241,8 +355,11 @@ def main(argv=None):
         if command == "export-csv":
             sub.add_argument("path")
     commands.add_parser("summary", help="count active entries and owned copies")
+    commands.add_parser("backup", help="refresh snapshot.sqlite3 beside the database for Git")
     args = parser.parse_args(argv)
     try:
+        if args.command == "backup" and not Path(args.db).is_file():
+            raise ValueError("Database does not exist; refusing to replace a snapshot with an empty database")
         # Validate inputs before creating a database for common entry errors.
         values = {field: getattr(args, field) for field in FIELDS
                   if getattr(args, field, None) is not None} if args.command in ("add", "edit") else {}
@@ -250,6 +367,7 @@ def main(argv=None):
             values = normalize(values)
         with closing(connect(args.db)) as db:
             if args.command == "init":
+                (Path(args.db).parent / "inbox").mkdir(parents=True, exist_ok=True)
                 print("Inventory ready: " + str(Path(args.db)))
             elif args.command == "add":
                 with db:
@@ -270,7 +388,11 @@ def main(argv=None):
                                [merged[field] for field in FIELDS] + [args.id])
                 print("Updated entry {}.".format(args.id))
             elif args.command == "import-csv":
-                print(json.dumps(import_csv(db, args.path, args.dry_run), indent=2))
+                paths = args.paths or [str(Path(args.db).parent / "inbox")]
+                result = import_paths(db, paths, args.dry_run)
+                print(json.dumps(result, indent=2))
+                if any(row["status"] == "error" for row in result["files"]):
+                    return 1
             elif args.command in ("list", "export-csv"):
                 rows = query(db, args)
                 if args.command == "list":
@@ -281,7 +403,8 @@ def main(argv=None):
                         raise ValueError("export destination cannot be the database")
                     # Exclusive creation protects existing exports and source CSVs.
                     with target.open("x", encoding="utf-8", newline="") as output:
-                        writer = csv.DictWriter(output, fieldnames=FIELDS, extrasaction="ignore")
+                        writer = csv.DictWriter(output, fieldnames=FIELDS + SOURCE_FIELDS,
+                                                extrasaction="ignore")
                         writer.writeheader()
                         writer.writerows(rows)
                     print("Exported {} entries to {}.".format(len(rows), target))
@@ -289,6 +412,9 @@ def main(argv=None):
                 row = db.execute("SELECT count(*) AS entries, coalesce(sum(quantity),0) AS copies "
                                  "FROM inventory WHERE quantity > 0").fetchone()
                 print(json.dumps(dict(row), indent=2))
+            elif args.command == "backup":
+                target = backup_database(db)
+                print("Database snapshot ready: {}\nCommit this file and the imports/ folder beside it.".format(target))
         return 0
     except (ValueError, OSError, sqlite3.Error, csv.Error) as exc:
         print("Error: {}".format(exc), file=sys.stderr)

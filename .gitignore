@@ -1,5 +1,12 @@
 __pycache__/
 *.py[cod]
-data/
+data/*
 *.sqlite3
 *.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+.DS_Store
+
+# Preserve original imports and a deliberate database snapshot in Git.
+!data/imports/
+!data/snapshot.sqlite3
