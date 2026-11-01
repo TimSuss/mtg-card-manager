@@ -6,6 +6,9 @@ data/*
 *.sqlite3-wal
 *.sqlite3-shm
 .DS_Store
+.venv/
+.env*
+!.env.prices.example
 
 # Preserve original imports and a deliberate database snapshot in Git.
 !data/imports/

@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep MTG price tracking scheduled daily
+
+[Timer]
+OnCalendar=*-*-* 16:00:00 UTC
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

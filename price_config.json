@@ -1,0 +1,20 @@
+{
+  "provider": "tcgplayer",
+  "currency": "USD",
+  "price_kind": "retail",
+  "lookback_days": 30,
+  "min_history_days": 7,
+  "max_age_days": 3,
+  "rise_fraction": "0.25",
+  "min_rise_amount": "1.00",
+  "near_high_fraction": "0.95",
+  "fee_fraction": "0.15",
+  "shipping_per_lot": "1.25",
+  "min_unit_price": "2.00",
+  "min_net_proceeds": "5.00",
+  "min_profit": "5.00",
+  "profit_fraction": "0.30",
+  "cooldown_days": 7,
+  "excluded_boxes": [],
+  "eligible_conditions": ["near_mint", "nm"]
+}

@@ -1,0 +1,2 @@
+# Streaming keeps MTGJSON's large history files practical on a Raspberry Pi.
+ijson==3.5.1

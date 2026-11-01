@@ -1,7 +1,8 @@
 # MTG card manager
 
 A local inventory stored in **SQLite**, with manual entry and CSV import/export.
-Requires Python 3.9 or newer; no third-party packages or database server required.
+Requires Python 3.9 or newer; inventory commands need no third-party packages or
+database server. The optional price tracker uses one streaming JSON dependency.
 
 ## Why SQLite?
 
@@ -246,16 +247,31 @@ writer rather than independently updating collections on both machines. If futur
 price history makes snapshots large or frequently changing, move database backups to
 dedicated backup storage; archived CSVs can stay in Git.
 
-## Future pricing
+## Price tracking and sell-review emails
 
-Future price observations should live in a separate table keyed to the printing,
-finish, provider, currency, and observation time. Purchase price is what you paid;
-market prices change over time and should not overwrite it. That history can support
-trend queries and sell-decision metrics later. Price fetching, sales tracking, and
-metrics are intentionally left for subsequent steps.
+The [Pi setup guide](docs/pi-price-tracker.md) walks through installation, email, and
+running the daily service. Start with a history import, then keep prices current daily:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-prices.txt
+.venv/bin/python mtg_prices.py --config price_config.json check --history
+.venv/bin/python mtg_prices.py alerts --status pending
+```
+
+The history file can be large; it is streamed rather than loaded entirely into RAM.
+The initial command only queues local alerts. Email requires SMTP settings and an
+explicit `--send-email` flag; see the guide before enabling the Pi timer.
+
+Prices are from MTGJSON, matched to the exact Scryfall printing and finish. The default
+is TCGplayer paper retail reference prices in USD. History is stored separately in the
+same inventory database, and `backup` includes prices and the email outbox. Purchase
+costs are never overwritten. Settings and thresholds live in `price_config.json`.
 
 ## Checks
 
 ```sh
-python3 -m unittest discover -s tests -v
+.venv/bin/python -m unittest discover -s tests -v
 ```
+
+Inventory-only checks without the pricing dependency: `python3 -m unittest discover -s tests -p test_inventory.py -v`.

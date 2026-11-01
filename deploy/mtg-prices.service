@@ -1,0 +1,15 @@
+[Unit]
+Description=MTG inventory daily prices and email alerts
+StartLimitIntervalSec=2h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/mtg-card-manager
+EnvironmentFile=%h/mtg-card-manager/.env.prices
+ExecStart=%h/mtg-card-manager/.venv/bin/python mtg_prices.py --config price_config.json check --send-email
+TimeoutStartSec=45min
+Restart=on-failure
+RestartSec=15min
+NoNewPrivileges=true
+UMask=0077
