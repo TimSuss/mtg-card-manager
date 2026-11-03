@@ -2,7 +2,7 @@
   "provider": "tcgplayer",
   "currency": "USD",
   "price_kind": "retail",
-  "lookback_days": 30,
+  "lookback_days": 90,
   "min_history_days": 7,
   "max_age_days": 3,
   "rise_fraction": "0.25",
