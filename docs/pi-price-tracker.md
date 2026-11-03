@@ -44,10 +44,16 @@ For each active inventory entry:
    artificial history. An initial history import can satisfy this immediately.
 2. Require at least $2 per copy and $5 estimated net proceeds for the lot.
    Net proceeds = quoted price × quantity × (1 − 15% fees) − $1.25 shipping per lot.
-3. Flag either a rise of at least 25% **and** $1 above the median of the prior
-   observations, with the latest price within 5% of the window's high; or a profit
-   target of at least $5 and 30% of recorded purchase cost after the same expenses.
-   The profit rule only runs if a purchase price in the quote currency is recorded.
+3. Flag if any of these rules qualifies:
+   - A rise of at least 25% **and** $1 above the median of the prior observations,
+     with the latest price within 5% of the window's high.
+   - A unit price strictly over $12 (`median_min_unit_price`) and at least 92% of
+     that historical median (`median_fraction`). The median excludes the latest
+     quote and uses `lookback_days` (30 by default; set to 90 for a longer window).
+     This rule can flag flat or slightly declining prices without a known purchase
+     cost or proximity to the recent high. The net-proceeds filter still applies.
+   - A profit target of at least $5 and 30% of recorded purchase cost after the
+     same expenses. This rule requires a purchase price in the quote currency.
 4. Queue a review alert containing printing, finish, box, quantity, source, quote date,
    baseline, estimated proceeds/profit, and the reasons. Your final decision still
    needs the actual condition, shipping method, selling venue, and whether you want

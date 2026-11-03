@@ -69,15 +69,35 @@ class PriceTests(unittest.TestCase):
         signal = result["signals"][0]
         self.assertEqual(signal["estimated_net_proceeds"], "32.75")
         self.assertEqual(signal["estimated_profit"], "26.25")
-        self.assertEqual(set(signal["reasons"]), {"price_rise_near_recent_high", "estimated_profit_target"})
+        self.assertEqual(set(signal["reasons"]), {"price_rise_near_recent_high", "estimated_profit_target",
+                                                "price_near_historical_median"})
         self.assertEqual(self.evaluate()["new_alerts"], 0)
 
-    def test_flat_prices_without_known_cost_do_not_signal(self):
-        self.ingest(current=10)
+    def test_low_value_flat_prices_without_known_cost_do_not_signal(self):
+        self.ingest(current=4, baseline=4)
         self.assertEqual(self.evaluate()["evaluation"], {"no_signal": 1})
 
+    def test_median_rule_boundaries_without_known_cost(self):
+        for current, baseline, qualifies in (
+            (20, 20, True), (18.40, 20, True), (18.39, 20, False),
+            (10, 10, False), (12, 12, False), (12.01, 12, True),
+        ):
+            with self.subTest(current=current, baseline=baseline):
+                self.ingest(current=current, baseline=baseline)
+                signals = self.evaluate()["signals"]
+                self.assertEqual(bool(signals), qualifies)
+                if qualifies:
+                    self.assertEqual(signals[0]["reasons"], ["price_near_historical_median"])
+
+    def test_median_rule_still_requires_minimum_net_proceeds(self):
+        self.ingest(current=13, baseline=13)
+        self.settings["shipping_per_lot"] = prices.money("10")
+        with self.db:
+            self.db.execute("UPDATE inventory SET quantity=1")
+        self.assertEqual(self.evaluate()["evaluation"], {"below_value_threshold": 1})
+
     def test_profit_target_requires_matching_purchase_currency(self):
-        self.ingest(current=10)
+        self.ingest(current=10, baseline=20)
         with self.db:
             self.db.execute("UPDATE inventory SET purchase_price='1', purchase_currency='EUR'")
         self.assertEqual(self.evaluate()["signals"], [])

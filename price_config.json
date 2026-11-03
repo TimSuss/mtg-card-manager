@@ -8,6 +8,8 @@
   "rise_fraction": "0.25",
   "min_rise_amount": "1.00",
   "near_high_fraction": "0.95",
+  "median_min_unit_price": "12.00",
+  "median_fraction": "0.92",
   "fee_fraction": "0.15",
   "shipping_per_lot": "1.25",
   "min_unit_price": "2.00",

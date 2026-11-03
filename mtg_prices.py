@@ -29,6 +29,7 @@ DEFAULTS = {
     "provider": "tcgplayer", "currency": "USD", "price_kind": "retail",
     "lookback_days": 30, "min_history_days": 7, "max_age_days": 3,
     "rise_fraction": "0.25", "min_rise_amount": "1.00", "near_high_fraction": "0.95",
+    "median_min_unit_price": "12.00", "median_fraction": "0.92",
     "fee_fraction": "0.15", "shipping_per_lot": "1.25", "min_unit_price": "2.00",
     "min_net_proceeds": "5.00", "min_profit": "5.00", "profit_fraction": "0.30",
     "cooldown_days": 7, "excluded_boxes": [], "eligible_conditions": ["near_mint", "nm"],
@@ -57,6 +58,8 @@ def load_settings(path=None):
         raise ValueError("min_history_days must be at least 2 and below lookback_days")
     if settings["fee_fraction"] >= 1 or not 0 < settings["near_high_fraction"] <= 1:
         raise ValueError("fee_fraction must be below 1; near_high_fraction must be in (0,1]")
+    if not 0 < settings["median_fraction"] <= 1:
+        raise ValueError("median_fraction must be in (0,1]")
     if settings["provider"] not in ("tcgplayer", "cardkingdom", "cardmarket", "cardsphere", "manapool"):
         raise ValueError("Unsupported MTGJSON paper price provider")
     if settings["price_kind"] not in ("retail", "buylist"):
@@ -263,6 +266,9 @@ def signal_for(db, entry, settings, today):
     if (rise >= settings["rise_fraction"] and current - baseline >= settings["min_rise_amount"]
             and current >= high * settings["near_high_fraction"]):
         reasons.append("price_rise_near_recent_high")
+    if (current > settings["median_min_unit_price"]
+            and current >= baseline * settings["median_fraction"]):
+        reasons.append("price_near_historical_median")
     profit = None
     if entry["purchase_price"] and entry["purchase_currency"].upper() == settings["currency"]:
         cost = money(entry["purchase_price"]) * quantity
