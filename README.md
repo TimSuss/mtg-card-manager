@@ -194,6 +194,35 @@ database backup, and reimporting them into the original database adds copies.
 The source columns in exports are informational: reimported entries link to the new
 import file, with the previous source columns preserved in their original row JSON.
 
+To export all owned cards for **Cardsphere Haves**, run this on the Pi from the
+repository directory:
+
+```sh
+python3 mtg_cardsphere.py --db data/inventory.sqlite3 ~/cardsphere-haves.csv
+```
+
+The standalone exporter uses Python's standard library and opens the database in
+read-only mode. It writes a ManaBox-compatible CSV with Scryfall printing IDs,
+quantities, finishes (including etched), conditions, and languages. Zero-quantity
+entries are omitted. It refuses to overwrite files or export entries with missing
+Scryfall IDs, unknown/unsupported conditions, missing languages, or altered/misprint
+flags; fix or review those entries before retrying. It exports no buying offers or
+price limits. Inventory entries stay separate; compare the total copy count rather
+than the row count if Cardsphere combines identical entries.
+
+From a separate Mac terminal, copy the result (replace `USER@PI` with your SSH target):
+
+```sh
+scp USER@PI:cardsphere-haves.csv ~/Downloads/cardsphere-haves.csv
+```
+
+Import into Cardsphere's Haves using its CSV importer. If asked for a source format,
+choose ManaBox. Review unmatched cards, exact printings, quantities, conditions,
+languages, and especially etched finishes before completing the import. Cardsphere's
+preview is the final compatibility check; generating a CSV alone does not verify
+server-side matching. Review how the import handles existing Haves before repeating
+an upload.
+
 For custom queries, open the SQLite file with a database viewer or the `sqlite3` CLI:
 
 ```sql
