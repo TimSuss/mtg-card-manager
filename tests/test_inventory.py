@@ -312,8 +312,9 @@ class InventoryTests(unittest.TestCase):
             "Lightning Bolt,m10,nonfoil,2,Trade Box\n"
         ))
         update = self.root / "update.csv"
-        update.write_text("Name,Set code,Quantity\nSol Ring,cmm,0\nCounterspell,2xm,3\n"
-                          "Unknown Card,,2\n")
+        update.write_text("Name,Set code,Quantity,Finish\nSol Ring,cmm,2,\n"
+                          "Sol Ring,cmm,1,nonfoil\nLightning Bolt,m10,0,\n"
+                          "Counterspell,2xm,3,\nUnknown Card,,2,\n")
         args = ("update-box-csv", str(update), "--box", "Trade")
         with mock.patch("builtins.input", side_effect=["1", "2", "1", ""]):
             self.assertIn("Cancelled", self.run_cli(*args)[1])
@@ -322,9 +323,11 @@ class InventoryTests(unittest.TestCase):
             code, output, _ = self.run_cli(*args)
         self.assertEqual(code, 0)
         self.assertIn("no matching entry. Skipped", output)
+        self.assertIn("3 to 5 copies", output)
+        self.assertIn("5 to 6 copies", output)
         rows = self.db.execute("SELECT name, box, quantity FROM inventory ORDER BY id").fetchall()
         self.assertEqual([tuple(row) for row in rows], [
-            ("Sol Ring", "Trade Box", 2), ("Sol Ring", "Trade Box", 0),
+            ("Sol Ring", "Trade Box", 2), ("Sol Ring", "Trade Box", 6),
             ("Sol Ring", "Storage Box", 4), ("Lightning Bolt", "Trade Box", 2),
             ("Counterspell", "Trade Box", 3),
         ])

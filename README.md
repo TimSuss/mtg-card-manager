@@ -145,7 +145,7 @@ file archives its original bytes if needed without adding inventory again.
 the exact same file again is skipped, even under a different filename. Changed files
 are treated as new additions: a later full ManaBox export can therefore double-count
 existing cards. Import your initial collection once, then import files containing
-new additions or use `update-box-csv` to revise quantities in an existing box.
+new additions or use `update-box-csv` to add copies to an existing box.
 Byte-level duplicate protection does not detect equivalent files with reordered rows
 or changed whitespace.
 
@@ -193,10 +193,10 @@ when supplied. The box flags control which boxes are used.
 - `move-csv` treats quantities as the number of copies to move. Moving part of an
   entry splits it and carries its original import details to the destination. You can
   confirm a new destination label during review.
-- `update-box-csv` treats quantities as new totals for the matched entries. Use
-  `0` to record that you no longer have copies of an entry. Unlisted entries and
-  existing card details stay as they are. To add an unmatched card, include a
-  Scryfall ID or a name and set, then select **Add as a new entry** during review.
+- `update-box-csv` treats quantities as copies to add. If the box has 3 copies
+  and the CSV lists 2, the new total is 5. Rows with quantity `0` are skipped.
+  To add an unmatched card, include a Scryfall ID or a name and set, then select
+  **Add as a new entry** during review. Each confirmed run adds the listed copies.
 
 For partial box matches and partial or ambiguous card matches, choose a numbered
 option. Press Enter to skip a card or cancel box selection. Review the final changes

@@ -24,6 +24,7 @@ SOURCE_FIELDS = ("source_filename", "source_row", "imported_at", "source_sha256"
 PRINTING_FIELDS = ("set_code", "set_name", "collector_number")
 VARIANT_FIELDS = ("finish", "language", "condition", "misprint", "altered")
 SQLITE_NOCASE = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+SQLITE_MAX_INTEGER = 2**63 - 1
 DEFAULTS = dict.fromkeys(FIELDS, "")
 DEFAULTS.update(quantity=1, finish="nonfoil", condition="unknown", language="en",
                 misprint=0, altered=0)
@@ -208,7 +209,7 @@ def read_csv(data, *, box_operation=False):
                 if "quantity" not in values:
                     raise ValueError("provide a quantity")
                 normalized = normalize(values, allow_name_only=True)
-                if normalized["quantity"] > 2**63 - 1:
+                if normalized["quantity"] > SQLITE_MAX_INTEGER:
                     raise ValueError("quantity is too large for SQLite")
                 rows.append((line, {key: normalized[key] for key in values}, raw))
             else:
@@ -459,7 +460,7 @@ def select_card(line, values, entries, remaining, *, adding, loose=False):
         describe_choice(entry, remaining[entry["id"]]) + (" [different card details]" if score == 0 else "")
         for score, entry in candidates
     ]
-    can_add = adding and not exact and values["quantity"] > 0 and (
+    can_add = adding and not exact and (
         values.get("scryfall_id") or values.get("set_code") or values.get("set_name")
     )
     if can_add:
@@ -512,17 +513,14 @@ def plan_move(line, entry, quantity, entries, remaining):
 
 def plan_box_changes(rows, entries, destination, *, moving, loose=False):
     remaining = {entry["id"]: entry["quantity"] for entry in entries}
-    claimed = set()
     changes = []
     for line, values, _ in rows:
         quantity = values["quantity"]
+        if not quantity:
+            continue
         entry, add = select_card(line, values, entries, remaining, adding=not moving, loose=loose)
         if add:
             new_entry = normalize({**values, "box": destination})
-            identity = card_identity(new_entry)
-            if identity in claimed:
-                raise ValueError(f"Line {line}: the same new card is already in the update")
-            claimed.add(identity)
             changes.append((line, new_entry, None, quantity))
         elif entry is not None:
             if moving:
@@ -530,11 +528,11 @@ def plan_box_changes(rows, entries, destination, *, moving, loose=False):
                 continue
             entry_id = entry["id"]
             before = remaining[entry_id]
-            if entry_id in claimed:
-                raise ValueError(f"Line {line}: entry {entry_id} already has an update in this CSV")
-            claimed.add(entry_id)
-            if before != quantity:
-                changes.append((line, entry, before, quantity))
+            total = before + quantity
+            if total > SQLITE_MAX_INTEGER:
+                raise ValueError(f"Line {line}: the new quantity is too large for SQLite")
+            remaining[entry_id] = total
+            changes.append((line, entry, before, quantity))
     return changes
 
 
@@ -557,7 +555,7 @@ def write_box_changes(db, changes, destination, *, moving):
             )
         else:
             db.execute(f"UPDATE inventory SET quantity = ?, {timestamp} WHERE id = ?",
-                       (quantity, entry["id"]))
+                       (before + quantity, entry["id"]))
 
 
 def review_box_csv(db, args):
@@ -575,7 +573,7 @@ def review_box_csv(db, args):
     destination = resolve_box(boxes, target, "destination" if moving else "target", allow_new=moving)
     if moving and source == destination:
         raise ValueError("Choose different source and destination boxes")
-    print(f"Move from {source!r} to {destination!r}" if moving else f"Update box {destination!r}")
+    print(f"Move from {source!r} to {destination!r}" if moving else f"Add copies to box {destination!r}")
     affected = (source, destination) if moving else (destination,)
     snapshots = {box: box_entries(db, box) for box in affected}
     if not snapshots[affected[0]]:
@@ -588,7 +586,8 @@ def review_box_csv(db, args):
         elif moving:
             print(f"  Line {line}: move {quantity} of {before} copies of {label} (entry {entry['id']})")
         else:
-            print(f"  Line {line}: {label} (entry {entry['id']}), {before} to {quantity} copies")
+            print(f"  Line {line}: add {quantity} copies of {label} (entry {entry['id']}), "
+                  f"{before} to {before + quantity} copies")
     if not changes:
         print("No changes to apply.")
     elif args.dry_run:
@@ -655,8 +654,8 @@ def main(argv=None):
     mover.add_argument("path", help="CSV with card names or Scryfall IDs and quantities to move")
     mover.add_argument("--from-box", required=True, help="source box label")
     mover.add_argument("--to-box", required=True, help="destination box label")
-    updater = commands.add_parser("update-box-csv", help="review and update an existing box using a CSV")
-    updater.add_argument("path", help="CSV with card names or Scryfall IDs and new total quantities")
+    updater = commands.add_parser("update-box-csv", help="review and add copies to an existing box using a CSV")
+    updater.add_argument("path", help="CSV with card names or Scryfall IDs and quantities to add")
     updater.add_argument("--box", required=True, help="existing box label")
     for command in (mover, updater):
         command.add_argument("--dry-run", action="store_true", help="review changes without writing them")
