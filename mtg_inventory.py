@@ -430,7 +430,7 @@ def describe_choice(entry, available):
     return description
 
 
-def select_card(line, values, entries, remaining, *, adding):
+def select_card(line, values, entries, remaining, *, adding, loose=False):
     matches = [(card_match(values, entry), entry) for entry in entries
                if adding or entry["quantity"] > 0]
     candidates = sorted(((score, entry) for score, entry in matches if score >= 0.72),
@@ -446,8 +446,19 @@ def select_card(line, values, entries, remaining, *, adding):
         return exact[0], False
     if exact:
         candidates = [(1, entry) for entry in exact]
+    elif loose:
+        name = match_key(values.get("name", ""))
+        printing_id = match_key(values.get("scryfall_id", ""))
+        candidates.extend((0, entry) for score, entry in matches
+                          if score < 0.72 and (adding or remaining[entry["id"]] > 0)
+                          and ((name and name == match_key(entry["name"])) or (
+                              printing_id and printing_id == match_key(entry["scryfall_id"])
+                          )))
     label = f"Line {line}: {describe_card(values)}, quantity {values['quantity']}"
-    choices = [describe_choice(entry, remaining[entry["id"]]) for _, entry in candidates]
+    choices = [
+        describe_choice(entry, remaining[entry["id"]]) + (" [different card details]" if score == 0 else "")
+        for score, entry in candidates
+    ]
     can_add = adding and not exact and values["quantity"] > 0 and (
         values.get("scryfall_id") or values.get("set_code") or values.get("set_name")
     )
@@ -499,13 +510,13 @@ def plan_move(line, entry, quantity, entries, remaining):
     return changes
 
 
-def plan_box_changes(rows, entries, destination, *, moving):
+def plan_box_changes(rows, entries, destination, *, moving, loose=False):
     remaining = {entry["id"]: entry["quantity"] for entry in entries}
     claimed = set()
     changes = []
     for line, values, _ in rows:
         quantity = values["quantity"]
-        entry, add = select_card(line, values, entries, remaining, adding=not moving)
+        entry, add = select_card(line, values, entries, remaining, adding=not moving, loose=loose)
         if add:
             new_entry = normalize({**values, "box": destination})
             identity = card_identity(new_entry)
@@ -569,7 +580,7 @@ def review_box_csv(db, args):
     snapshots = {box: box_entries(db, box) for box in affected}
     if not snapshots[affected[0]]:
         raise ValueError(f"Box {affected[0]!r} no longer has inventory entries")
-    changes = plan_box_changes(rows, snapshots[affected[0]], destination, moving=moving)
+    changes = plan_box_changes(rows, snapshots[affected[0]], destination, moving=moving, loose=args.loose)
     for line, entry, before, quantity in changes:
         label = describe_card(entry)
         if before is None:
@@ -649,6 +660,8 @@ def main(argv=None):
     updater.add_argument("--box", required=True, help="existing box label")
     for command in (mover, updater):
         command.add_argument("--dry-run", action="store_true", help="review changes without writing them")
+        command.add_argument("--loose", action="store_true",
+                             help="offer matching names or Scryfall IDs with different card details")
     for command in ("list", "export-csv"):
         sub = commands.add_parser(command)
         for field in ("name", "set_code", "location", "box", "scryfall_id"):

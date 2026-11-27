@@ -281,6 +281,30 @@ class InventoryTests(unittest.TestCase):
                           inventory.query(self.db, argparse.Namespace(name="Sol"))],
                          [("Box 2", 2), ("Box 1", 1), ("Box 2", 2)])
 
+    def test_loose_csv_matching_offers_same_name_printings_in_the_selected_box(self):
+        inventory.import_csv(self.db, self.csv_file(
+            "Name,Set code,Scryfall ID,Quantity,Box\n"
+            "Frontline Medic,clb,other-printing,2,Box 2\n"
+            "Frontline Medic,gtc,csv-printing,1,favorites\n"
+            "Yavimaya Coast,ori,coast-printing,1,favorites\n"
+        ))
+        move = self.root / "move.csv"
+        move.write_text("Name,Set code,Scryfall ID,Quantity\n"
+                        "Frontline Medic,gtc,csv-printing,1\n"
+                        "Yavimaya Coast,ori,coast-printing,1\n")
+        args = ("move-csv", str(move), "--from-box", "Box 2", "--to-box", "favorites", "--dry-run")
+        with mock.patch("builtins.input") as prompt:
+            self.assertIn("No changes to apply", self.run_cli(*args)[1])
+            prompt.assert_not_called()
+        with mock.patch("builtins.input", side_effect=["1"]) as prompt:
+            code, output, _ = self.run_cli(*args, "--loose")
+        self.assertEqual(code, 0)
+        prompt.assert_called_once()
+        self.assertIn("[different card details]", output)
+        self.assertIn("move 1 of 2 copies of Frontline Medic [clb", output)
+        self.assertIn("no matching entry. Skipped.", output)
+        self.assertEqual(self.db.execute("SELECT quantity FROM inventory WHERE id = 1").fetchone()[0], 2)
+
     def test_update_box_csv_selects_variant_and_adds_missing_card(self):
         inventory.import_csv(self.db, self.csv_file(
             "Name,Set code,Finish,Quantity,Box\nSol Ring,cmm,foil,2,Trade Box\n"

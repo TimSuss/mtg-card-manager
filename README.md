@@ -203,6 +203,10 @@ option. Press Enter to skip a card or cancel box selection. Review the final cha
 and enter `y` to apply them together. Add `--dry-run` to walk through matching and see
 the changes without applying them.
 
+If a CSV lists a different printing or condition, add `--loose` to see entries in
+the selected box with the same name or Scryfall ID. Select any of these suggestions
+explicitly after checking its printing and other details.
+
 ### Search and export
 
 ```sh
