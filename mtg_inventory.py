@@ -455,19 +455,21 @@ def select_card(line, values, entries, remaining, *, adding, loose=False):
                           and ((name and name == match_key(entry["name"])) or (
                               printing_id and printing_id == match_key(entry["scryfall_id"])
                           )))
+    can_add = adding and not exact and (
+        values.get("scryfall_id") or values.get("set_code") or values.get("set_name")
+    )
     label = f"Line {line}: {describe_card(values)}, quantity {values['quantity']}"
+    if not candidates:
+        if can_add:
+            return None, True
+        print(label + " — no matching entry. Skipped.")
+        return None, False
     choices = [
         describe_choice(entry, remaining[entry["id"]]) + (" [different card details]" if score == 0 else "")
         for score, entry in candidates
     ]
-    can_add = adding and not exact and (
-        values.get("scryfall_id") or values.get("set_code") or values.get("set_name")
-    )
     if can_add:
         choices.append("Add as a new entry")
-    if not choices:
-        print(label + " — no matching entry. Skipped.")
-        return None, False
     selected = choose(label, choices)
     if selected is None:
         return None, False
@@ -582,7 +584,7 @@ def review_box_csv(db, args):
     for line, entry, before, quantity in changes:
         label = describe_card(entry)
         if before is None:
-            print(f"  Line {line}: add {quantity} copies of {label}")
+            print(f"  Line {line}: add {quantity} copies of {label} (new entry)")
         elif moving:
             print(f"  Line {line}: move {quantity} of {before} copies of {label} (entry {entry['id']})")
         else:

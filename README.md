@@ -195,8 +195,10 @@ when supplied. The box flags control which boxes are used.
   confirm a new destination label during review.
 - `update-box-csv` treats quantities as copies to add. If the box has 3 copies
   and the CSV lists 2, the new total is 5. Rows with quantity `0` are skipped.
-  To add an unmatched card, include a Scryfall ID or a name and set, then select
-  **Add as a new entry** during review. Each confirmed run adds the listed copies.
+  An unmatched card with a Scryfall ID or a name and set appears as a new entry
+  in the batch preview. If there are possible matches, you can choose one or
+  select **Add as a new entry** when the CSV has enough details. Each confirmed
+  run adds the listed copies.
 
 For partial box matches and partial or ambiguous card matches, choose a numbered
 option. Press Enter to skip a card or cancel box selection. Review the final changes

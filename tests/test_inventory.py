@@ -316,15 +316,17 @@ class InventoryTests(unittest.TestCase):
                           "Sol Ring,cmm,1,nonfoil\nLightning Bolt,m10,0,\n"
                           "Counterspell,2xm,3,\nUnknown Card,,2,\n")
         args = ("update-box-csv", str(update), "--box", "Trade")
-        with mock.patch("builtins.input", side_effect=["1", "2", "1", ""]):
+        with mock.patch("builtins.input", side_effect=["1", "2", ""]):
             self.assertIn("Cancelled", self.run_cli(*args)[1])
         self.assertEqual(self.db.execute("SELECT sum(quantity) FROM inventory").fetchone()[0], 11)
-        with mock.patch("builtins.input", side_effect=["1", "2", "1", "y"]):
+        with mock.patch("builtins.input", side_effect=["1", "2", "y"]) as prompt:
             code, output, _ = self.run_cli(*args)
         self.assertEqual(code, 0)
+        self.assertEqual(prompt.call_count, 3)
         self.assertIn("no matching entry. Skipped", output)
         self.assertIn("3 to 5 copies", output)
         self.assertIn("5 to 6 copies", output)
+        self.assertIn("add 3 copies of Counterspell [2xm, nonfoil, unknown, en] (new entry)", output)
         rows = self.db.execute("SELECT name, box, quantity FROM inventory ORDER BY id").fetchall()
         self.assertEqual([tuple(row) for row in rows], [
             ("Sol Ring", "Trade Box", 2), ("Sol Ring", "Trade Box", 6),
