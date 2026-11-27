@@ -144,10 +144,10 @@ file archives its original bytes if needed without adding inventory again.
 **Imports add inventory; they do not synchronize a collection snapshot.** Importing
 the exact same file again is skipped, even under a different filename. Changed files
 are treated as new additions: a later full ManaBox export can therefore double-count
-existing cards. For now, import your initial collection once, then import files containing
-only new additions or use `edit` for corrections. Byte-level duplicate protection does
-not detect equivalent files with reordered rows or changed whitespace. There is no
-import undo or snapshot reconciliation yet.
+existing cards. Import your initial collection once, then import files containing
+new additions or use `update-box-csv` to revise quantities in an existing box.
+Byte-level duplicate protection does not detect equivalent files with reordered rows
+or changed whitespace.
 
 ## Query and export
 
@@ -175,8 +175,35 @@ Use `edit ID --box ""` to clear a label, or `list --box ""` to find unassigned e
 Refresh your backup after assigning boxes to preserve those changes in Git.
 
 Manual additions accept `add ... --box "Box 1"`. CSV imports accept a `Box` or `Box name`
-column; exports include `box`. Reimporting an identical file still skips its inventory,
-so use `assign-box` or `edit` to label cards that are already imported.
+column, and exports include `box`.
+
+#### Move or update cards from a CSV
+
+```sh
+python3 mtg_inventory.py move-csv move.csv --from-box "Box 1" --to-box "Box 2"
+python3 mtg_inventory.py update-box-csv counts.csv --box "Box 2"
+```
+
+Both commands accept exported inventory CSVs, ManaBox CSVs, or a short list such as
+`Name,Set code,Quantity`. Each row needs a name or Scryfall ID and a quantity.
+Include a Scryfall ID or set and collector number to distinguish printings. Finish,
+language, condition, misprint, and altered values help distinguish inventory entries
+when supplied. The box flags control which boxes are used.
+
+- `move-csv` treats quantities as the number of copies to move. Moving part of an
+  entry splits it and carries its original import details to the destination. You can
+  confirm a new destination label during review.
+- `update-box-csv` treats quantities as new totals for the matched entries. Use
+  `0` to record that you no longer have copies of an entry. Unlisted entries and
+  existing card details stay as they are. To add an unmatched card, include a
+  Scryfall ID or a name and set, then select **Add as a new entry** during review.
+
+For partial box matches and partial or ambiguous card matches, choose a numbered
+option. Press Enter to skip a card or cancel box selection. Review the final changes
+and enter `y` to apply them together. Add `--dry-run` to walk through matching and see
+the changes without applying them.
+
+### Search and export
 
 ```sh
 python3 mtg_inventory.py list --name "bolt"

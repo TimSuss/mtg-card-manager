@@ -11,6 +11,7 @@ import sys
 import tempfile
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
+from difflib import SequenceMatcher
 from pathlib import Path
 
 
@@ -20,6 +21,9 @@ FIELDS = (
     "purchase_price", "purchase_currency", "misprint", "altered", "notes",
 )
 SOURCE_FIELDS = ("source_filename", "source_row", "imported_at", "source_sha256", "source_archive")
+PRINTING_FIELDS = ("set_code", "set_name", "collector_number")
+VARIANT_FIELDS = ("finish", "language", "condition", "misprint", "altered")
+SQLITE_NOCASE = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 DEFAULTS = dict.fromkeys(FIELDS, "")
 DEFAULTS.update(quantity=1, finish="nonfoil", condition="unknown", language="en",
                 misprint=0, altered=0)
@@ -119,7 +123,7 @@ def backup_database(db):
     return target
 
 
-def normalize(values):
+def normalize(values, *, allow_name_only=False):
     result = dict(DEFAULTS)
     result.update({key: str(value).strip() for key, value in values.items() if key in FIELDS})
     try:
@@ -129,7 +133,7 @@ def normalize(values):
     if result["quantity"] < 0:
         raise ValueError("quantity cannot be negative")
     if not result["scryfall_id"] and not (
-        result["name"] and (result["set_code"] or result["set_name"])
+        result["name"] and (allow_name_only or result["set_code"] or result["set_name"])
     ):
         raise ValueError("provide a Scryfall ID, or a name plus set code/set name")
     result["set_code"] = result["set_code"].lower()
@@ -174,7 +178,7 @@ def header_key(value):
     return "_".join(value.strip().lower().replace("_", " ").split())
 
 
-def read_csv(data):
+def read_csv(data, *, box_operation=False):
     text = data.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
     if not reader.fieldnames:
@@ -184,8 +188,10 @@ def read_csv(data):
     if len(known) != len(set(known)):
         raise ValueError("CSV has multiple columns mapping to the same inventory field")
     if not ("scryfall_id" in known or ("name" in known and (
-        "set_code" in known or "set_name" in known
+        box_operation or "set_code" in known or "set_name" in known
     ))):
+        if box_operation:
+            raise ValueError("CSV needs a Scryfall ID or Name column")
         raise ValueError("CSV needs Scryfall ID, or Name plus Set code/Set name columns")
     rows = []
     errors = []
@@ -198,11 +204,20 @@ def read_csv(data):
                 mapped[index]: raw[key] for index, key in enumerate(reader.fieldnames)
                 if mapped[index] in FIELDS and raw[key].strip()
             }
-            rows.append((line, normalize(values), raw))
+            if box_operation:
+                if "quantity" not in values:
+                    raise ValueError("provide a quantity")
+                normalized = normalize(values, allow_name_only=True)
+                if normalized["quantity"] > 2**63 - 1:
+                    raise ValueError("quantity is too large for SQLite")
+                rows.append((line, {key: normalized[key] for key in values}, raw))
+            else:
+                rows.append((line, normalize(values), raw))
         except ValueError as exc:
             errors.append("line {}: {}".format(line, exc))
     if errors:
-        raise ValueError("CSV rejected; no cards added:\n" + "\n".join(errors))
+        message = "CSV rejected; no changes made" if box_operation else "CSV rejected; no cards added"
+        raise ValueError(message + ":\n" + "\n".join(errors))
     if not rows:
         raise ValueError("CSV contains no inventory rows")
     return rows
@@ -306,6 +321,278 @@ def import_paths(db, paths, dry_run=False):
             "copies": sum(r.get("copies", 0) for r in results), "files": results}
 
 
+def match_key(value):
+    return " ".join(str(value).casefold().split())
+
+
+def match_score(search, value):
+    if not search or not value:
+        return 0
+    if search == value:
+        return 1
+    if search in value or value in search:
+        return 0.95
+    return SequenceMatcher(None, search, value).ratio()
+
+
+def review_input(prompt):
+    try:
+        return input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        raise ValueError("CSV review cancelled; no changes made") from None
+
+
+def confirm(prompt):
+    return review_input(prompt + " [y/N] ") in ("y", "yes")
+
+
+def choose(title, choices):
+    print(title)
+    for index, label in enumerate(choices, 1):
+        print(f"  {index}. {label}")
+    indices = {str(index): index - 1 for index in range(1, len(choices) + 1)}
+    while True:
+        answer = review_input("Choose a number or press Enter to skip: ")
+        if not answer:
+            return None
+        if answer in indices:
+            return indices[answer]
+        print(f"Enter a number from 1 to {len(choices)}.")
+
+
+def resolve_box(boxes, label, role, *, allow_new=False):
+    label = label.strip()
+    # SQLite's NOCASE collation folds ASCII letters.
+    key = label.translate(SQLITE_NOCASE)
+    exact = next((box for box in boxes if box.translate(SQLITE_NOCASE) == key), None)
+    if exact is not None:
+        return exact
+    scores = [(match_score(match_key(label), match_key(box)), box) for box in boxes]
+    candidates = [box for score, box in sorted(scores, reverse=True) if score >= 0.72]
+    if candidates:
+        choices = [repr(box) for box in candidates]
+        if allow_new:
+            choices.append(f"Use new box {label!r}")
+        selected = choose(f"Review {role} box {label!r}:", choices)
+        if selected is not None:
+            return (candidates + [label])[selected]
+        raise ValueError("CSV review cancelled; no changes made")
+    if allow_new and confirm(f"Use new destination box {label!r}?"):
+        return label
+    raise ValueError(f"No {role} box selected for {label!r}; no changes made")
+
+
+def card_match(values, entry):
+    card_id = match_key(values.get("scryfall_id", ""))
+    entry_id = match_key(entry["scryfall_id"])
+    if card_id and entry_id and card_id != entry_id:
+        return 0
+    exact_id = bool(card_id and card_id == entry_id)
+    if any(field in values and match_key(values[field]) != match_key(entry[field])
+           for field in VARIANT_FIELDS):
+        return 0
+    if exact_id:
+        return 1
+    # A known different printing is never a candidate for a partial name match.
+    printing_fields = PRINTING_FIELDS
+    if values.get("set_code") and entry["set_code"]:
+        printing_fields = ("set_code", "collector_number")
+    for field in printing_fields:
+        actual = match_key(entry[field])
+        if field in values and actual and match_key(values[field]) != actual:
+            return 0
+    score = match_score(match_key(values.get("name", "")), match_key(entry["name"]))
+    exact_set = any(field in values and match_key(values[field]) == match_key(entry[field])
+                    for field in ("set_code", "set_name"))
+    missing_printing = any(field in values and not entry[field] for field in printing_fields)
+    if score == 1 and (card_id or not exact_set or missing_printing):
+        return 0.95
+    return score
+
+
+def describe_card(entry):
+    label = entry.get("name") or entry["scryfall_id"]
+    details = [entry.get(field) for field in (
+        "set_code", "set_name", "collector_number", "finish", "condition", "language", "scryfall_id",
+    )]
+    details.extend(label for field, label in (("misprint", "misprint"), ("altered", "altered"))
+                   if entry.get(field))
+    return label + (" [" + ", ".join(value for value in details if value) + "]" if any(details) else "")
+
+
+def describe_choice(entry, available):
+    description = f"Entry {entry['id']}: {describe_card(entry)} ({available} copies)"
+    for field in ("location", "notes"):
+        if entry[field]:
+            description += f", {field}={entry[field]!r}"
+    if entry["purchase_price"]:
+        description += f", paid {entry['purchase_price']} {entry['purchase_currency']} per copy"
+    return description
+
+
+def select_card(line, values, entries, remaining, *, adding):
+    matches = [(card_match(values, entry), entry) for entry in entries
+               if adding or entry["quantity"] > 0]
+    candidates = sorted(((score, entry) for score, entry in matches if score >= 0.72),
+                        key=lambda match: (-match[0], match[1]["id"]))
+    exact = [entry for score, entry in candidates if score == 1]
+    if not adding:
+        candidates = [(score, entry) for score, entry in candidates if remaining[entry["id"]] > 0]
+        available = [entry for entry in exact if remaining[entry["id"]] > 0]
+        if exact and not available:
+            raise ValueError(f"Line {line}: no copies of {describe_card(values)} remain to move")
+        exact = available
+    if len(exact) == 1:
+        return exact[0], False
+    if exact:
+        candidates = [(1, entry) for entry in exact]
+    label = f"Line {line}: {describe_card(values)}, quantity {values['quantity']}"
+    choices = [describe_choice(entry, remaining[entry["id"]]) for _, entry in candidates]
+    can_add = adding and not exact and values["quantity"] > 0 and (
+        values.get("scryfall_id") or values.get("set_code") or values.get("set_name")
+    )
+    if can_add:
+        choices.append("Add as a new entry")
+    if not choices:
+        print(label + " — no matching entry. Skipped.")
+        return None, False
+    selected = choose(label, choices)
+    if selected is None:
+        return None, False
+    if selected == len(candidates):
+        return None, True
+    return candidates[selected][1], False
+
+
+def box_entries(db, box):
+    return [dict(row) for row in db.execute(
+        "SELECT * FROM inventory WHERE box = ? COLLATE NOCASE ORDER BY id", (box,)
+    )]
+
+
+def card_identity(entry):
+    printing = (match_key(entry["scryfall_id"]),) if entry["scryfall_id"] else tuple(
+        match_key(entry[field]) for field in ("name", *PRINTING_FIELDS)
+    )
+    return printing + tuple(match_key(entry[field]) for field in VARIANT_FIELDS)
+
+
+def plan_move(line, entry, quantity, entries, remaining):
+    lots = [entry]
+    if quantity > remaining[entry["id"]]:
+        identity = card_identity(entry)
+        lots.extend(other for other in entries if other["id"] != entry["id"]
+                    and remaining[other["id"]] > 0 and card_identity(other) == identity)
+    available = sum(remaining[lot["id"]] for lot in lots)
+    if quantity > available:
+        raise ValueError(f"Line {line}: {describe_card(entry)} has {available} copies left, "
+                         f"but the CSV requests {quantity}")
+    changes = []
+    for lot in lots:
+        before = remaining[lot["id"]]
+        moved = min(quantity, before)
+        changes.append((line, lot, before, moved))
+        remaining[lot["id"]] -= moved
+        quantity -= moved
+        if not quantity:
+            break
+    return changes
+
+
+def plan_box_changes(rows, entries, destination, *, moving):
+    remaining = {entry["id"]: entry["quantity"] for entry in entries}
+    claimed = set()
+    changes = []
+    for line, values, _ in rows:
+        quantity = values["quantity"]
+        entry, add = select_card(line, values, entries, remaining, adding=not moving)
+        if add:
+            new_entry = normalize({**values, "box": destination})
+            identity = card_identity(new_entry)
+            if identity in claimed:
+                raise ValueError(f"Line {line}: the same new card is already in the update")
+            claimed.add(identity)
+            changes.append((line, new_entry, None, quantity))
+        elif entry is not None:
+            if moving:
+                changes.extend(plan_move(line, entry, quantity, entries, remaining))
+                continue
+            entry_id = entry["id"]
+            before = remaining[entry_id]
+            if entry_id in claimed:
+                raise ValueError(f"Line {line}: entry {entry_id} already has an update in this CSV")
+            claimed.add(entry_id)
+            if before != quantity:
+                changes.append((line, entry, before, quantity))
+    return changes
+
+
+def write_box_changes(db, changes, destination, *, moving):
+    timestamp = "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+    for _, entry, before, quantity in changes:
+        if before is None:
+            insert(db, entry)
+        elif moving and before == quantity:
+            db.execute(f"UPDATE inventory SET box = ?, {timestamp} WHERE id = ?",
+                       (destination, entry["id"]))
+        elif moving:
+            db.execute(f"UPDATE inventory SET quantity = ?, {timestamp} WHERE id = ?",
+                       (before - quantity, entry["id"]))
+            columns = (*FIELDS, "import_id", "source_row", "raw_json", "created_at")
+            new_entry = {**entry, "box": destination, "quantity": quantity}
+            db.execute(
+                f"INSERT INTO inventory ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                [new_entry[column] for column in columns],
+            )
+        else:
+            db.execute(f"UPDATE inventory SET quantity = ?, {timestamp} WHERE id = ?",
+                       (quantity, entry["id"]))
+
+
+def review_box_csv(db, args):
+    moving = args.command == "move-csv"
+    target = args.to_box if moving else args.box
+    if not target.strip():
+        raise ValueError("Provide a nonempty box label")
+    rows = read_csv(Path(args.path).read_bytes(), box_operation=True)
+    if moving and any(values["quantity"] == 0 for _, values, _ in rows):
+        raise ValueError("Move quantities must be positive")
+    boxes = [row[0] for row in db.execute(
+        "SELECT DISTINCT box COLLATE NOCASE FROM inventory ORDER BY box COLLATE NOCASE"
+    )]
+    source = resolve_box(boxes, args.from_box, "source") if moving else None
+    destination = resolve_box(boxes, target, "destination" if moving else "target", allow_new=moving)
+    if moving and source == destination:
+        raise ValueError("Choose different source and destination boxes")
+    print(f"Move from {source!r} to {destination!r}" if moving else f"Update box {destination!r}")
+    affected = (source, destination) if moving else (destination,)
+    snapshots = {box: box_entries(db, box) for box in affected}
+    if not snapshots[affected[0]]:
+        raise ValueError(f"Box {affected[0]!r} no longer has inventory entries")
+    changes = plan_box_changes(rows, snapshots[affected[0]], destination, moving=moving)
+    for line, entry, before, quantity in changes:
+        label = describe_card(entry)
+        if before is None:
+            print(f"  Line {line}: add {quantity} copies of {label}")
+        elif moving:
+            print(f"  Line {line}: move {quantity} of {before} copies of {label} (entry {entry['id']})")
+        else:
+            print(f"  Line {line}: {label} (entry {entry['id']}), {before} to {quantity} copies")
+    if not changes:
+        print("No changes to apply.")
+    elif args.dry_run:
+        print("Dry run. No changes made.")
+    elif confirm(f"Apply {len(changes)} changes?"):
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            if any(box_entries(db, box) != entries for box, entries in snapshots.items()):
+                raise ValueError("Inventory changed during review. Rerun the command to review the latest entries")
+            write_box_changes(db, changes, destination, moving=moving)
+        print(f"Applied {len(changes)} changes.")
+    else:
+        print("Cancelled. No changes made.")
+
+
 def query(db, args):
     clauses, params = [], []
     for field in ("name", "set_code", "location", "box", "finish", "scryfall_id"):
@@ -353,6 +640,15 @@ def main(argv=None):
     importer = commands.add_parser("import-csv", help="import CSV files or folders; archive originals")
     importer.add_argument("paths", nargs="*", help="files/folders; defaults to the database's inbox folder")
     importer.add_argument("--dry-run", action="store_true", help="validate without adding inventory")
+    mover = commands.add_parser("move-csv", help="review and move copies between boxes using a CSV")
+    mover.add_argument("path", help="CSV with card names or Scryfall IDs and quantities to move")
+    mover.add_argument("--from-box", required=True, help="source box label")
+    mover.add_argument("--to-box", required=True, help="destination box label")
+    updater = commands.add_parser("update-box-csv", help="review and update an existing box using a CSV")
+    updater.add_argument("path", help="CSV with card names or Scryfall IDs and new total quantities")
+    updater.add_argument("--box", required=True, help="existing box label")
+    for command in (mover, updater):
+        command.add_argument("--dry-run", action="store_true", help="review changes without writing them")
     for command in ("list", "export-csv"):
         sub = commands.add_parser(command)
         for field in ("name", "set_code", "location", "box", "scryfall_id"):
@@ -367,6 +663,8 @@ def main(argv=None):
     try:
         if args.command == "backup" and not Path(args.db).is_file():
             raise ValueError("Database does not exist; refusing to replace a snapshot with an empty database")
+        if args.command in ("move-csv", "update-box-csv") and not Path(args.db).is_file():
+            raise ValueError("Inventory database does not exist")
         # Validate inputs before creating a database for common entry errors.
         values = {field: getattr(args, field) for field in FIELDS
                   if getattr(args, field, None) is not None} if args.command in ("add", "edit") else {}
@@ -411,6 +709,8 @@ def main(argv=None):
                 print(json.dumps(result, indent=2))
                 if any(row["status"] == "error" for row in result["files"]):
                     return 1
+            elif args.command in ("move-csv", "update-box-csv"):
+                review_box_csv(db, args)
             elif args.command in ("list", "export-csv"):
                 rows = query(db, args)
                 if args.command == "list":

@@ -234,6 +234,93 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(len(inventory.query(self.db, argparse.Namespace(box="Box 3"))), 1)
         self.assertEqual(self.run_cli("assign-box", "Box 4", "--source-filename", "missing.csv")[0], 1)
 
+    def test_move_csv_reviews_partial_matches_and_preserves_split_provenance(self):
+        source = self.csv_file(
+            "Name,Set code,Quantity,Box,Notes\nSol Ring,cmm,4,Trade Box,Keep this\n"
+            "Lightning Bolt,m10,1,Storage Box,\n"
+        )
+        inventory.import_csv(self.db, source)
+        move = self.root / "move.csv"
+        move.write_text("Name,Quantity\nSol Rign,2\n")
+        args = ("move-csv", str(move), "--from-box", "Trade", "--to-box", "Storage")
+        with mock.patch("builtins.input", side_effect=["1", "1", "1"]):
+            code, output, _ = self.run_cli(*args, "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("move 2 of 4 copies of Sol Ring", output)
+        before = inventory.query(self.db, argparse.Namespace(name="Sol"))[0]
+        self.assertEqual(before["quantity"], 4)
+        with mock.patch("builtins.input", side_effect=["1", "1", "1", "y"]):
+            self.assertEqual(self.run_cli(*args)[0], 0)
+        source, destination = inventory.query(self.db, argparse.Namespace(name="Sol"))
+        self.assertEqual((source["box"], source["quantity"]), ("Trade Box", 2))
+        self.assertEqual((destination["box"], destination["quantity"]), ("Storage Box", 2))
+        for field in (*inventory.SOURCE_FIELDS, "notes", "raw_json", "import_id"):
+            self.assertEqual(destination[field], before[field])
+
+    def test_move_csv_draws_from_multiple_lots_and_rolls_back_on_failure(self):
+        inventory.import_csv(self.db, self.csv_file(
+            "Name,Set code,Quantity,Box\nSol Ring,cmm,2,Box 1\nSol Ring,cmm,3,Box 1\n"
+            "Lightning Bolt,m10,1,Box 2\n"
+        ))
+        move = self.root / "move.csv"
+        move.write_text("Name,Set code,Quantity\nSol Ring,cmm,4\n")
+        args = ("move-csv", str(move), "--from-box", "Box 1", "--to-box", "Box 2")
+        self.db.execute("""CREATE TRIGGER fail_split BEFORE INSERT ON inventory
+                        BEGIN SELECT RAISE(ABORT, 'test split failure'); END""")
+        with mock.patch("builtins.input", side_effect=["1", "y"]):
+            code, _, errors = self.run_cli(*args)
+        self.assertEqual(code, 1)
+        self.assertIn("test split failure", errors)
+        self.assertEqual([(entry["box"], entry["quantity"]) for entry in
+                          inventory.query(self.db, argparse.Namespace(name="Sol"))],
+                         [("Box 1", 2), ("Box 1", 3)])
+        self.db.execute("DROP TRIGGER fail_split")
+        with mock.patch("builtins.input", side_effect=["1", "y"]):
+            self.assertEqual(self.run_cli(*args)[0], 0)
+        self.assertEqual([(entry["box"], entry["quantity"]) for entry in
+                          inventory.query(self.db, argparse.Namespace(name="Sol"))],
+                         [("Box 2", 2), ("Box 1", 1), ("Box 2", 2)])
+
+    def test_update_box_csv_selects_variant_and_adds_missing_card(self):
+        inventory.import_csv(self.db, self.csv_file(
+            "Name,Set code,Finish,Quantity,Box\nSol Ring,cmm,foil,2,Trade Box\n"
+            "Sol Ring,cmm,nonfoil,3,Trade Box\nSol Ring,cmm,foil,4,Storage Box\n"
+            "Lightning Bolt,m10,nonfoil,2,Trade Box\n"
+        ))
+        update = self.root / "update.csv"
+        update.write_text("Name,Set code,Quantity\nSol Ring,cmm,0\nCounterspell,2xm,3\n"
+                          "Unknown Card,,2\n")
+        args = ("update-box-csv", str(update), "--box", "Trade")
+        with mock.patch("builtins.input", side_effect=["1", "2", "1", ""]):
+            self.assertIn("Cancelled", self.run_cli(*args)[1])
+        self.assertEqual(self.db.execute("SELECT sum(quantity) FROM inventory").fetchone()[0], 11)
+        with mock.patch("builtins.input", side_effect=["1", "2", "1", "y"]):
+            code, output, _ = self.run_cli(*args)
+        self.assertEqual(code, 0)
+        self.assertIn("no matching entry. Skipped", output)
+        rows = self.db.execute("SELECT name, box, quantity FROM inventory ORDER BY id").fetchall()
+        self.assertEqual([tuple(row) for row in rows], [
+            ("Sol Ring", "Trade Box", 2), ("Sol Ring", "Trade Box", 0),
+            ("Sol Ring", "Storage Box", 4), ("Lightning Bolt", "Trade Box", 2),
+            ("Counterspell", "Trade Box", 3),
+        ])
+
+    def test_box_csv_rechecks_inventory_after_confirmation(self):
+        update = self.csv_file("Name,Set code,Quantity\nSol Ring,cmm,4\n")
+        self.assertEqual(self.run_cli("add", "--name", "Sol Ring", "--set-code", "cmm",
+                                      "--box", "Box 1")[0], 0)
+
+        def change_inventory(prompt):
+            with self.db:
+                self.db.execute("UPDATE inventory SET quantity = 2")
+            return "y"
+
+        with mock.patch("builtins.input", side_effect=change_inventory):
+            code, _, errors = self.run_cli("update-box-csv", str(update), "--box", "Box 1")
+        self.assertEqual(code, 1)
+        self.assertIn("Inventory changed during review", errors)
+        self.assertEqual(self.db.execute("SELECT quantity FROM inventory").fetchone()[0], 2)
+
     def test_bad_row_rejects_entire_file(self):
         path = self.csv_file("Name,Set code,Quantity\nSol Ring,cmm,1\nLightning Bolt,m10,-2\n")
         with self.assertRaisesRegex(ValueError, "line 3"):
